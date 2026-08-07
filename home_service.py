@@ -42,7 +42,6 @@ INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:50
 MS365_SERVICE_URL = os.getenv("MS365_SERVICE_URL","http://localhost:7700")
 EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
 BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
-REDIS_SERVICE_URL = os.getenv("REDIS_SERVICE_URL","http://localhost:6380")
 BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
@@ -109,74 +108,11 @@ RESET_TOKEN_SECRET = (
 reset_serializer = URLSafeTimedSerializer(RESET_TOKEN_SECRET)
 
 # -----------------------
-# Redis cache helpers
+# Cache helpers
 # -----------------------
-# All home-page cache operations go through redis_service's /home/cache/* endpoints.
-# These routes live in DB 5 (API Response Cache) and enforce the correct TTLs
-# (5–15 min per section) without any session logic.
-#
-# Section → Redis key mapping (enforced by redis_service):
-#   "batches"  → home:batches   (10 min)
-#   "feedback" → home:feedback  (5 min)
-#   "offers"   → home:offers    (15 min)
-#   "about"    → home:about     (15 min)
-#
-# For non-home cache needs (e.g. session:user:<id>) the generic /apicache/*
-# and /session/* endpoints on redis_service are used directly.
-# -----------------------
-
-REDIS_SERVICE_URL = _get_env_value("REDIS_SERVICE_URL", "http://127.0.0.1:6380")
-
-
-def _redis_service_candidates() -> list[str]:
-    base = (REDIS_SERVICE_URL or "http://127.0.0.1:6380").rstrip("/")
-    candidates = [base]
-
-    if base.endswith(":6380"):
-        candidates.append(base[:-5] + ":6390")
-    elif base.endswith(":6390"):
-        candidates.append(base[:-5] + ":6380")
-    else:
-        candidates.extend(["http://127.0.0.1:6390", "http://127.0.0.1:6380"])
-
-    seen = set()
-    unique = []
-    for url in candidates:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
-    return unique
-
-
-def _redis_service_request(method: str, path: str, payload: Optional[dict] = None):
-    """Proxy cache operations to redis_service microservice."""
-    body = None
-    headers = {"Content-Type": "application/json"}
-
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-
-    last_error = None
-    for base in _redis_service_candidates():
-        url = f"{base}{path}"
-        req = urllib.request.Request(url=url, data=body, headers=headers, method=method.upper())
-        try:
-            with urllib.request.urlopen(req, timeout=2.5) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as http_err:
-            try:
-                detail = http_err.read().decode("utf-8")
-            except Exception:
-                detail = str(http_err)
-            last_error = f"HTTP {http_err.code} {detail}"
-            print(f"Redis service HTTP error [{method} {path}] @ {base}: {last_error}")
-        except Exception as exc:
-            last_error = str(exc)
-            print(f"Redis service request failed [{method} {path}] @ {base}: {exc}")
-
-    if last_error:
-        print(f"Redis service request exhausted [{method} {path}] last_error={last_error}")
+def _cache_backend_request(method: str, path: str, payload: Optional[dict] = None):
+    """Cache backend is intentionally decoupled; fallback to DB/non-cache path."""
+    _ = (method, path, payload)
     return None
 
 
@@ -184,13 +120,13 @@ def _redis_service_request(method: str, path: str, payload: Optional[dict] = Non
 
 def home_cache_get(section: str):
     """
-    Fetch a home-page section from the redis_service home cache.
+    Fetch a home-page section from the cache backend.
     Returns the cached data dict on HIT, or None on MISS / error.
     section: "batches" | "feedback" | "offers" | "about"
     """
     try:
         encoded = urllib.parse.quote(section, safe="")
-        response = _redis_service_request("GET", f"/home/cache/get?section={encoded}")
+        response = _cache_backend_request("GET", f"/home/cache/get?section={encoded}")
         if response and response.get("success") and response.get("found"):
             print(f"✅ Home cache HIT: home:{section}")
             return response.get("data")
@@ -201,15 +137,15 @@ def home_cache_get(section: str):
 
 def home_cache_set(section: str, data, ttl: Optional[int] = None):
     """
-    Store a home-page section in the redis_service home cache.
-    ttl is optional — redis_service will use the section default if omitted.
+    Store a home-page section in the cache backend.
+    ttl is optional and backend-dependent.
     section: "batches" | "feedback" | "offers" | "about"
     """
     try:
         payload = {"section": section, "data": data}
         if ttl:
             payload["ttl"] = ttl
-        response = _redis_service_request("POST", "/home/cache/set", payload=payload)
+        response = _cache_backend_request("POST", "/home/cache/set", payload=payload)
         if response and response.get("success"):
             print(f"✅ Home cache SET: home:{section} ttl={response.get('ttl')}s")
     except Exception as e:
@@ -218,13 +154,13 @@ def home_cache_set(section: str, data, ttl: Optional[int] = None):
 
 def home_cache_delete(section: str):
     """
-    Invalidate a home-page section in the redis_service cache.
+    Invalidate a home-page section in the cache backend.
     Pass section='*' to flush all home cache keys at once.
     section: "batches" | "feedback" | "offers" | "about" | "*"
     """
     try:
         encoded = urllib.parse.quote(section, safe="")
-        response = _redis_service_request("DELETE", f"/home/cache/delete?section={encoded}")
+        response = _cache_backend_request("DELETE", f"/home/cache/delete?section={encoded}")
         if response and response.get("success"):
             print(f"🗑️ Home cache DELETE: home:{section}")
     except Exception as e:
@@ -232,11 +168,11 @@ def home_cache_delete(section: str):
 
 
 # ── Session cache (DB 0 via /session/*) ──────────────────────────────────────
-# Canonical key written by redis_service: session:{user_id}
+# Canonical key: session:{user_id}
 
 def _session_set(user_id: int, value, ttl: int = 86400):
     try:
-        response = _redis_service_request(
+        response = _cache_backend_request(
             "POST",
             "/session/set",
             payload={"user_id": int(user_id), "data": value, "ttl": int(ttl)},
@@ -250,7 +186,7 @@ def _session_set(user_id: int, value, ttl: int = 86400):
 def _session_delete(user_id: int):
     try:
         encoded_user_id = urllib.parse.quote(str(int(user_id)), safe="")
-        response = _redis_service_request("DELETE", f"/session/delete?user_id={encoded_user_id}")
+        response = _cache_backend_request("DELETE", f"/session/delete?user_id={encoded_user_id}")
         if response and response.get("success"):
             print(f"🗑️ session DELETE: session:{user_id}")
     except Exception as e:
@@ -259,7 +195,7 @@ def _session_delete(user_id: int):
 
 def _profile_set(user_id: int, value, ttl: int = 1800):
     try:
-        response = _redis_service_request(
+        response = _cache_backend_request(
             "POST",
             "/profile/set",
             payload={"user_id": int(user_id), "data": value, "ttl": int(ttl)},
@@ -273,7 +209,7 @@ def _profile_set(user_id: int, value, ttl: int = 1800):
 def _profile_delete(user_id: int):
     try:
         encoded_user_id = urllib.parse.quote(str(int(user_id)), safe="")
-        response = _redis_service_request("DELETE", f"/profile/delete?user_id={encoded_user_id}")
+        response = _cache_backend_request("DELETE", f"/profile/delete?user_id={encoded_user_id}")
         if response and response.get("success"):
             print(f"🗑️ profile DELETE: user:{user_id}")
     except Exception as e:
@@ -283,7 +219,7 @@ def _profile_delete(user_id: int):
 def _auth_set(user_id: int, roles, usertype: str, ttl: int = 3600):
     try:
         safe_roles = roles if isinstance(roles, list) else []
-        response = _redis_service_request(
+        response = _cache_backend_request(
             "POST",
             "/auth/set",
             payload={
@@ -302,7 +238,7 @@ def _auth_set(user_id: int, roles, usertype: str, ttl: int = 3600):
 def _auth_delete(user_id: int):
     try:
         encoded_user_id = urllib.parse.quote(str(int(user_id)), safe="")
-        response = _redis_service_request("DELETE", f"/auth/delete?user_id={encoded_user_id}")
+        response = _cache_backend_request("DELETE", f"/auth/delete?user_id={encoded_user_id}")
         if response and response.get("success"):
             print(f"🗑️ auth DELETE: roles:{user_id}")
     except Exception as e:
@@ -311,7 +247,7 @@ def _auth_delete(user_id: int):
 def _apicache_set(cache_key: str, value, ttl: int = 300):
     """Store any payload in DB 5 (API response cache) by raw cache_key."""
     try:
-        response = _redis_service_request(
+        response = _cache_backend_request(
             "POST",
             "/apicache/set",
             payload={"cache_key": cache_key, "response": value, "ttl": ttl},
@@ -326,7 +262,7 @@ def _apicache_delete(cache_key: str):
     """Invalidate an entry in DB 5 by raw cache_key."""
     try:
         encoded = urllib.parse.quote(cache_key, safe="")
-        response = _redis_service_request("DELETE", f"/apicache/delete?cache_key={encoded}")
+        response = _cache_backend_request("DELETE", f"/apicache/delete?cache_key={encoded}")
         if response and response.get("success"):
             print(f"🗑️ apicache DELETE: {cache_key}")
     except Exception as e:
@@ -825,7 +761,7 @@ async def home_login(
             # Store login API response in DB 5
             _apicache_set(f"home:user:{user['ID']}", profile, ttl=300)
         except Exception as e:
-            print(f"Redis session proxy write error: {e}")
+            print(f"Session proxy write error: {e}")
 
         print(
             "✅ [home_login:user] response prepared | "
@@ -1238,9 +1174,9 @@ async def user_logout(request: Request):
             # Remove only canonical session from DB 0 on logout.
             # Keep profile/auth/api caches to speed up subsequent logins.
             _session_delete(int(user_id))
-        except Exception as redis_exc:
+        except Exception as cache_exc:
             print(
-                f"⚠️ Redis session delete proxy failed on logout for USER_ID={user_id}: {redis_exc}"
+                f"⚠️ Session delete proxy failed on logout for USER_ID={user_id}: {cache_exc}"
             )
 
         print(
@@ -1482,7 +1418,7 @@ async def get_batches():
             "upcoming_batches": upcoming_batches,
         }
 
-        home_cache_set("batches", response_data)   # TTL = 10 min (redis_service default)
+        home_cache_set("batches", response_data)   # TTL = 10 min (default)
         print(f"⏱️ batches total time: {time.time() - start_time:.2f}s")
         return response_data
 
@@ -1545,7 +1481,7 @@ async def get_feedback():
 
         response_data = {"success": True, "feedbacks": feedbacks}
 
-        home_cache_set("feedback", response_data)  # TTL = 5 min (redis_service default)
+        home_cache_set("feedback", response_data)  # TTL = 5 min (default)
         print(f"[TIME]️ feedbacks total time: {time.time() - start_time:.2f}s")
         return response_data
 
@@ -1632,7 +1568,7 @@ async def get_gallery_items():
     Cache key : home:about  — gallery is part of the 'about' section family.
     TTL 15 min (rarely changes).
     """
-    cache_key = "about"   # maps to home:about in redis_service
+    cache_key = "about"   # maps to home:about
 
     cached_data = home_cache_get(cache_key)
     if cached_data:
@@ -1651,7 +1587,7 @@ async def get_gallery_items():
         ],
     }
 
-    home_cache_set(cache_key, response_data)  # TTL = 15 min (redis_service default)
+    home_cache_set(cache_key, response_data)  # TTL = 15 min (default)
 
     return response_data
 
