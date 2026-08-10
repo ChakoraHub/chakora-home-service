@@ -93,6 +93,30 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     password: str
 
+
+# ── Secure PIN (mobile device login) request models ──────────────────────────
+
+class PinSetupRequest(BaseModel):
+    user_id: int
+    device_id: str
+    device_name: Optional[str] = None
+    platform: Optional[str] = None
+    pin: str
+
+
+class PinLoginRequest(BaseModel):
+    user_id: int
+    device_id: str
+    pin: str
+
+
+class PinResetRequest(BaseModel):
+    username: str          # email or username — verified like /home/login
+    password: str
+    device_id: str
+    new_pin: str
+
+
 ORACLE_HOST = os.getenv("ORACLE_HOST", "56.228.73.210")
 ORACLE_PORT = int(os.getenv("ORACLE_PORT", "1521"))
 ORACLE_SERVICE_NAME = os.getenv("ORACLE_SERVICE_NAME", "FREEPDB1")
@@ -887,6 +911,368 @@ async def home_login(
                 pass
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Secure PIN — mobile device login (Screen 2)
+# Password authenticates the user once; PIN authenticates that trusted device.
+# ══════════════════════════════════════════════════════════════════════════
+
+PIN_MAX_FAILED_ATTEMPTS = int(os.getenv("PIN_MAX_FAILED_ATTEMPTS", "5"))
+
+
+@app.post("/home/pin/setup")
+async def pin_setup(payload: PinSetupRequest):
+    """Create or replace the Secure PIN for a (user_id, device_id) pair."""
+    pin = (payload.pin or "").strip()
+    if not pin.isdigit() or len(pin) != 6:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "PIN must be exactly 6 digits"},
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "db connection failed"},
+        )
+
+    cursor = conn.cursor()
+    try:
+        pin_hash = generate_password_hash(pin)
+
+        cursor.execute(
+            """
+            MERGE INTO NRM_USER_DEVICE_PIN t
+            USING (SELECT :user_id AS USER_ID, :device_id AS DEVICE_ID FROM dual) s
+            ON (t.USER_ID = s.USER_ID AND t.DEVICE_ID = s.DEVICE_ID)
+            WHEN MATCHED THEN UPDATE SET
+                PIN_HASH        = :pin_hash,
+                DEVICE_NAME     = :device_name,
+                PLATFORM        = :platform,
+                FAILED_ATTEMPTS = 0,
+                IS_ACTIVE       = 'Y',
+                UPDATED_AT      = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN INSERT
+                (USER_ID, DEVICE_ID, DEVICE_NAME, PLATFORM, PIN_HASH)
+                VALUES (:user_id, :device_id, :device_name, :platform, :pin_hash)
+            """,
+            {
+                "user_id": payload.user_id,
+                "device_id": payload.device_id,
+                "device_name": payload.device_name,
+                "platform": payload.platform,
+                "pin_hash": pin_hash,
+            },
+        )
+        conn.commit()
+        print(f"✅ [pin-setup] PIN saved | user_id={payload.user_id} device_id={payload.device_id}")
+
+        return {"success": True, "message": "Secure PIN set up successfully"}
+
+    except Exception as e:
+        print(f"❌ [pin-setup] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Failed to set up Secure PIN"},
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/home/pin/login")
+async def pin_login(payload: PinLoginRequest):
+    """Authenticate a trusted device using its Secure PIN."""
+    pin = (payload.pin or "").strip()
+    if not pin:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "PIN is required"},
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "db connection failed"},
+        )
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT ID, PIN_HASH, FAILED_ATTEMPTS, IS_ACTIVE
+            FROM NRM_USER_DEVICE_PIN
+            WHERE USER_ID = :1 AND DEVICE_ID = :2
+            """,
+            (payload.user_id, payload.device_id),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            print(f"❌ [pin-login] no PIN registered | user_id={payload.user_id} device_id={payload.device_id}")
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": "No Secure PIN set up on this device"},
+            )
+
+        record_id, pin_hash, failed_attempts, is_active = row
+
+        if str(is_active).strip().upper() != "Y":
+            print(f"🔒 [pin-login] device locked | user_id={payload.user_id} device_id={payload.device_id}")
+            return JSONResponse(
+                status_code=403,
+                content={"success": False, "message": "Device is locked. Please log in with your password."},
+            )
+
+        valid = False
+        try:
+            valid = check_password_hash(pin_hash, pin)
+        except Exception as exc:
+            print(f"❌ [pin-login] hash check error: {exc}")
+
+        if not valid:
+            new_failed = int(failed_attempts or 0) + 1
+            lock_now = new_failed >= PIN_MAX_FAILED_ATTEMPTS
+            cursor.execute(
+                """
+                UPDATE NRM_USER_DEVICE_PIN
+                SET FAILED_ATTEMPTS = :1,
+                    IS_ACTIVE = :2,
+                    UPDATED_AT = CURRENT_TIMESTAMP
+                WHERE ID = :3
+                """,
+                (new_failed, "N" if lock_now else "Y", record_id),
+            )
+            conn.commit()
+            print(
+                f"⚠️ [pin-login] invalid PIN | user_id={payload.user_id} device_id={payload.device_id} "
+                f"failed_attempts={new_failed} locked={lock_now}"
+            )
+            if lock_now:
+                return JSONResponse(
+                    status_code=403,
+                    content={"success": False, "message": "Too many attempts. Device locked — please log in with your password."},
+                )
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "message": "Incorrect PIN"},
+            )
+
+        # Success — reset failed attempts, stamp LAST_USED
+        cursor.execute(
+            """
+            UPDATE NRM_USER_DEVICE_PIN
+            SET FAILED_ATTEMPTS = 0,
+                LAST_USED = CURRENT_TIMESTAMP,
+                UPDATED_AT = CURRENT_TIMESTAMP
+            WHERE ID = :1
+            """,
+            (record_id,),
+        )
+
+        cursor.execute(
+            "SELECT ID, USERNAME, EMAIL, PHONE, USERTYPE, PROFILE_PIC FROM NRM_USERS WHERE ID = :1",
+            (payload.user_id,),
+        )
+        _cols = [c[0] for c in cursor.description]
+        _row = cursor.fetchone()
+        user = dict(zip(_cols, _row)) if _row else None
+        conn.commit()
+
+        if not user:
+            print(f"❌ [pin-login] user not found after PIN match | user_id={payload.user_id}")
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": "User not found"},
+            )
+
+        profile = {
+            "id": user["ID"],
+            "username": user.get("USERNAME"),
+            "email": user.get("EMAIL"),
+            "phone": user.get("PHONE"),
+            "usertype": user.get("USERTYPE"),
+            "profile_pic": user.get("PROFILE_PIC"),
+        }
+        try:
+            # Same session/profile/auth cache writes as /home/login, so a PIN
+            # session looks identical downstream to a password session.
+            _session_set(int(user["ID"]), profile, ttl=86400)
+            _profile_set(int(user["ID"]), profile, ttl=1800)
+            _auth_set(
+                int(user["ID"]),
+                [str((user.get("USERTYPE") or "user")).lower()],
+                str((user.get("USERTYPE") or "user")).lower(),
+                ttl=3600,
+            )
+        except Exception as e:
+            print(f"Session proxy write error [pin-login]: {e}")
+
+        print(f"✅ [pin-login] success | user_id={payload.user_id} device_id={payload.device_id}")
+        return {"success": True, "login_type": "pin", "user": profile}
+
+    except Exception as e:
+        print(f"❌ [pin-login] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "PIN login failed"},
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/home/pin/reset")
+async def pin_reset(payload: PinResetRequest):
+    """Reset the Secure PIN for a device — requires full email+password re-auth."""
+    new_pin = (payload.new_pin or "").strip()
+    if not new_pin.isdigit() or len(new_pin) != 6:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "PIN must be exactly 6 digits"},
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "db connection failed"},
+        )
+
+    cursor = conn.cursor()
+    try:
+        # Re-verify identity the same way /home/login does.
+        cursor.execute(
+            """
+            SELECT u.ID, l.PASSWORD
+            FROM NRM_USERS u
+            JOIN NRM_LOGINS l ON u.ID = l.USER_ID
+            WHERE LOWER(TRIM(u.EMAIL)) = LOWER(TRIM(:login_value))
+               OR LOWER(TRIM(u.USERNAME)) = LOWER(TRIM(:login_value))
+            ORDER BY l.CREATED_AT DESC
+            FETCH FIRST 1 ROWS ONLY
+            """,
+            {"login_value": payload.username},
+        )
+        row = cursor.fetchone()
+        if not row:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": "User not found"},
+            )
+
+        user_id, db_password = row
+        db_password = db_password or ""
+        password_format = "hashed" if db_password.startswith(("scrypt:", "pbkdf2:")) else "plain"
+        try:
+            valid = (
+                check_password_hash(db_password, payload.password)
+                if password_format == "hashed"
+                else db_password == payload.password
+            )
+        except Exception:
+            valid = False
+
+        if not valid:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "message": "Invalid credentials"},
+            )
+
+        pin_hash = generate_password_hash(new_pin)
+        cursor.execute(
+            """
+            MERGE INTO NRM_USER_DEVICE_PIN t
+            USING (SELECT :user_id AS USER_ID, :device_id AS DEVICE_ID FROM dual) s
+            ON (t.USER_ID = s.USER_ID AND t.DEVICE_ID = s.DEVICE_ID)
+            WHEN MATCHED THEN UPDATE SET
+                PIN_HASH = :pin_hash,
+                FAILED_ATTEMPTS = 0,
+                IS_ACTIVE = 'Y',
+                UPDATED_AT = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN INSERT
+                (USER_ID, DEVICE_ID, PIN_HASH)
+                VALUES (:user_id, :device_id, :pin_hash)
+            """,
+            {"user_id": user_id, "device_id": payload.device_id, "pin_hash": pin_hash},
+        )
+        conn.commit()
+        print(f"✅ [pin-reset] PIN reset | user_id={user_id} device_id={payload.device_id}")
+
+        return {"success": True, "message": "Secure PIN reset successfully"}
+
+    except Exception as e:
+        print(f"❌ [pin-reset] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Failed to reset Secure PIN"},
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/home/pin/status")
+async def pin_status(user_id: int, device_id: str):
+    """Tell the app whether this device already has a Secure PIN set up."""
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "db connection failed"},
+        )
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT 1 FROM NRM_USER_DEVICE_PIN
+            WHERE USER_ID = :1 AND DEVICE_ID = :2 AND IS_ACTIVE = 'Y'
+            """,
+            (user_id, device_id),
+        )
+        exists = cursor.fetchone() is not None
+        return {"success": True, "pin_exists": exists}
+    except Exception as e:
+        print(f"❌ [pin-status] EXCEPTION: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Failed to check PIN status"},
+        )
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.post("/home/forgot-password")
 async def home_forgot_password(payload: ForgotPasswordRequest):
     login_type = (payload.login_type or "").strip().lower()
@@ -1590,6 +1976,61 @@ async def get_gallery_items():
     home_cache_set(cache_key, response_data)  # TTL = 15 min (default)
 
     return response_data
+
+
+@app.get("/home/blogs")
+async def get_blog_items():
+    """Returns community/blog content for mobile app."""
+    return {
+        "success": True,
+        "posts": [
+            {
+                "title": "Getting Started with Flutter",
+                "summary": "A beginner-friendly walkthrough of widgets and state.",
+                "date": "Aug 2026",
+                "section": "Latest Articles",
+            },
+            {
+                "title": "New Batch Starting Soon",
+                "summary": "Registrations are now open for upcoming batches.",
+                "date": "Aug 2026",
+                "section": "Announcements",
+            },
+            {
+                "title": "Data + Cloud Learning Trends",
+                "summary": "What students should focus on in the current market.",
+                "date": "Jul 2026",
+                "section": "Technology News",
+            },
+        ],
+    }
+
+
+@app.get("/home/clients")
+async def get_clients_items():
+    """Returns clients/projects/testimonials for mobile community screen."""
+    return {
+        "success": True,
+        "clients": [
+            "Acme Corp",
+            "Globex Inc",
+            "Initech",
+        ],
+        "projects": [
+            "Student Portal Revamp",
+            "Internal Analytics Dashboard",
+        ],
+        "testimonials": [
+            {
+                "name": "Priya S.",
+                "quote": "The training program helped me land my first job.",
+            },
+            {
+                "name": "Arjun K.",
+                "quote": "Hands-on projects made all the difference.",
+            },
+        ],
+    }
 
 
 # ── Cache management endpoints (admin / internal use) ────────────────────────
