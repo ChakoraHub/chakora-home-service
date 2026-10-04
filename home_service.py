@@ -17,10 +17,12 @@ import urllib.error
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
 try:
     import boto3
 except Exception:
     boto3 = None
+
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -34,20 +36,20 @@ else:
 
 # ================= SERVICE URLS =================
 
-HOME_SERVICE_URL = os.getenv("HOME_SERVICE_URL","http://localhost:5001")
-MEETING_SERVICE_URL = os.getenv("MEETING_SERVICE_URL","http://localhost:9000")
-CHATBOT_SERVICE_URL = os.getenv("CHATBOT_SERVICE_URL","http://localhost:7600")
-ASSET_SERVICE_URL = os.getenv("ASSET_SERVICE_URL","http://localhost:8090")
-INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:5050")
-MS365_SERVICE_URL = os.getenv("MS365_SERVICE_URL","http://localhost:7700")
-EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
-BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
-BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
+HOME_SERVICE_URL = os.getenv("HOME_SERVICE_URL", "http://localhost:5001")
+MEETING_SERVICE_URL = os.getenv("MEETING_SERVICE_URL", "http://localhost:9000")
+CHATBOT_SERVICE_URL = os.getenv("CHATBOT_SERVICE_URL", "http://localhost:7600")
+ASSET_SERVICE_URL = os.getenv("ASSET_SERVICE_URL", "http://localhost:8090")
+INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL", "http://localhost:5050")
+MS365_SERVICE_URL = os.getenv("MS365_SERVICE_URL", "http://localhost:7700")
+EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL", "http://localhost:8002")
+BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL", "http://localhost:7500")
+BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL", "http://localhost:8020")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
 
-CANONICAL_HOST = os.getenv("CANONICAL_HOST","www.chakorahub.com").strip().lower()
-INTERNSHIP_PUBLIC_HOST = os.getenv("INTERNSHIP_PUBLIC_HOST","api.chakorahub.com").strip().lower()
+CANONICAL_HOST = os.getenv("CANONICAL_HOST", "www.chakorahub.com").strip().lower()
+INTERNSHIP_PUBLIC_HOST = os.getenv("INTERNSHIP_PUBLIC_HOST", "api.chakorahub.com").strip().lower()
 
 
 def _clean_env_value(raw_value):
@@ -62,6 +64,7 @@ def _clean_env_value(raw_value):
 def _get_env_value(name: str, default: str = "") -> str:
     value = _clean_env_value(os.getenv(name))
     return value or default
+
 
 app = FastAPI(title="home_service", version="1.0")
 
@@ -143,11 +146,6 @@ def _cache_backend_request(method: str, path: str, payload: Optional[dict] = Non
 # ── Home-section cache (DB 5 via /home/cache/*) ──────────────────────────────
 
 def home_cache_get(section: str):
-    """
-    Fetch a home-page section from the cache backend.
-    Returns the cached data dict on HIT, or None on MISS / error.
-    section: "batches" | "feedback" | "offers" | "about"
-    """
     try:
         encoded = urllib.parse.quote(section, safe="")
         response = _cache_backend_request("GET", f"/home/cache/get?section={encoded}")
@@ -160,11 +158,6 @@ def home_cache_get(section: str):
 
 
 def home_cache_set(section: str, data, ttl: Optional[int] = None):
-    """
-    Store a home-page section in the cache backend.
-    ttl is optional and backend-dependent.
-    section: "batches" | "feedback" | "offers" | "about"
-    """
     try:
         payload = {"section": section, "data": data}
         if ttl:
@@ -177,11 +170,6 @@ def home_cache_set(section: str, data, ttl: Optional[int] = None):
 
 
 def home_cache_delete(section: str):
-    """
-    Invalidate a home-page section in the cache backend.
-    Pass section='*' to flush all home cache keys at once.
-    section: "batches" | "feedback" | "offers" | "about" | "*"
-    """
     try:
         encoded = urllib.parse.quote(section, safe="")
         response = _cache_backend_request("DELETE", f"/home/cache/delete?section={encoded}")
@@ -192,7 +180,6 @@ def home_cache_delete(section: str):
 
 
 # ── Session cache (DB 0 via /session/*) ──────────────────────────────────────
-# Canonical key: session:{user_id}
 
 def _session_set(user_id: int, value, ttl: int = 86400):
     try:
@@ -268,8 +255,8 @@ def _auth_delete(user_id: int):
     except Exception as e:
         print(f"auth DELETE error [roles:{user_id}]: {e}")
 
+
 def _apicache_set(cache_key: str, value, ttl: int = 300):
-    """Store any payload in DB 5 (API response cache) by raw cache_key."""
     try:
         response = _cache_backend_request(
             "POST",
@@ -283,7 +270,6 @@ def _apicache_set(cache_key: str, value, ttl: int = 300):
 
 
 def _apicache_delete(cache_key: str):
-    """Invalidate an entry in DB 5 by raw cache_key."""
     try:
         encoded = urllib.parse.quote(cache_key, safe="")
         response = _cache_backend_request("DELETE", f"/apicache/delete?cache_key={encoded}")
@@ -344,24 +330,57 @@ def _get_reset_email_config_snapshot() -> dict:
 
 print(f"📧 Forgot-password email config snapshot: {_get_reset_email_config_snapshot()}")
 
-def get_db_connection():
-    try:
+
+# ==============================================================================
+# ORACLE CONNECTION POOLING (Enterprise-grade reliability)
+# ==============================================================================
+_db_pool = None
+
+def get_db_pool():
+    global _db_pool
+    if _db_pool is None:
         dsn = oracledb.makedsn(
             host=ORACLE_HOST,
             port=ORACLE_PORT,
             service_name=ORACLE_SERVICE_NAME,
         )
-
-        conn = oracledb.connect(
+        _db_pool = oracledb.create_pool(
             user=ORACLE_USER,
             password=ORACLE_PASSWORD,
             dsn=dsn,
+            min=2,
+            max=10,
+            increment=1,
+            getmode=oracledb.POOL_GETMODE_WAIT,
+            timeout=120,
+            wait_timeout=15,
         )
+        print("✅ Oracle DB connection pool initialized for CHAKORA schema")
+    return _db_pool
+
+
+def get_db_connection():
+    """Acquires a pooled connection with auto-reconnect fallback."""
+    try:
+        try:
+            pool = get_db_pool()
+            conn = pool.acquire()
+        except Exception as pool_err:
+            print(f"⚠️ Pool acquire warning ({pool_err}), using direct connect fallback...")
+            dsn = oracledb.makedsn(
+                host=ORACLE_HOST,
+                port=ORACLE_PORT,
+                service_name=ORACLE_SERVICE_NAME,
+            )
+            conn = oracledb.connect(
+                user=ORACLE_USER,
+                password=ORACLE_PASSWORD,
+                dsn=dsn,
+            )
 
         cursor = conn.cursor()
         cursor.execute("ALTER SESSION SET CURRENT_SCHEMA = CHAKORA")
         cursor.close()
-
         return conn
 
     except Exception as e:
@@ -468,12 +487,6 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
 
     # Primary: SMTP
     if sender and password:
-        print(
-            "📧 Forgot-password SMTP attempt | "
-            f"to={_mask_email_hint(to_email)} sender_env={config_snapshot['resolved_sender_env']!r} "
-            f"sender_hint={config_snapshot['resolved_sender_hint']!r} "
-            f"host={config_snapshot['smtp_host']} port={config_snapshot['smtp_port']}"
-        )
         try:
             msg = MIMEMultipart()
             msg["Subject"] = subject
@@ -507,11 +520,6 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
             raise RuntimeError("Email sender is not configured")
 
         try:
-            print(
-                "📧 Forgot-password SES attempt | "
-                f"to={_mask_email_hint(to_email)} sender_hint={_mask_email_hint(ses_sender)!r} "
-                f"aws_region={config_snapshot['aws_region']}"
-            )
             aws_region = (os.getenv("AWS_REGION") or os.getenv("SES_REGION") or "eu-north-1").strip()
             aws_access_key = (
                 os.getenv("AWS_ACCESS_KEY")
@@ -545,22 +553,10 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
                     _send_with_ses_client(ses)
                     return
                 except Exception as explicit_exc:
-                    explicit_error = str(explicit_exc)
-                    retryable_auth_errors = (
-                        "InvalidClientTokenId",
-                        "SignatureDoesNotMatch",
-                        "UnrecognizedClientException",
-                        "security token included in the request is invalid",
-                    )
-                    if any(token in explicit_error for token in retryable_auth_errors):
-                        print(
-                            "⚠️ SES explicit credentials rejected; retrying with default credential chain "
-                            f"(region={aws_region})"
-                        )
-                        ses = boto3.client("ses", region_name=aws_region)
-                        _send_with_ses_client(ses)
-                        return
-                    raise
+                    print(f"⚠️ SES explicit credentials error ({explicit_exc}); trying default chain...")
+                    ses = boto3.client("ses", region_name=aws_region)
+                    _send_with_ses_client(ses)
+                    return
             else:
                 ses = boto3.client("ses", region_name=aws_region)
                 _send_with_ses_client(ses)
@@ -581,31 +577,22 @@ def _resolve_reset_base_url(base_url_from_client: Optional[str]) -> str:
 @app.get("/health")
 async def health_check():
     """Health endpoint for load balancers / simple checks."""
-    return {"status": "ok", "service": "home_service"}
+    return {"status": "ok", "service": "home_service", "port": 5001}
 
 
+# ==============================================================================
+# AUTHENTICATION: LOGIN
+# ==============================================================================
 @app.post("/home/login")
 async def home_login(
     request: Request,
     body: Optional[LoginRequest] = Body(default=None),
 ):
     """Login endpoint used by both web and mobile apps."""
-
-    print(
-        "🔐 [home_login] request received | "
-        f"has_body={body is not None} method={request.method}"
-    )
-
     if body is not None:
         data = body.model_dump()
     else:
-        # Backward compatibility: accept form-encoded payloads from older clients.
         data = await _get_request_data(request)
-
-    print(
-        "🔐 [home_login] payload snapshot | "
-        f"keys={sorted(list(data.keys())) if isinstance(data, dict) else type(data).__name__}"
-    )
 
     username = (data.get("username") or "").strip()
     password = (data.get("password") or "").strip()
@@ -619,7 +606,7 @@ async def home_login(
         )
 
     # ------------------------------------------------------------------
-    # User login
+    # 1. User login (Students & General Users)
     # ------------------------------------------------------------------
     if login_type == "user":
         conn = get_db_connection()
@@ -627,20 +614,14 @@ async def home_login(
             print(f"❌ [home_login:user] db connection failed | username={username}")
             return JSONResponse(
                 status_code=500,
-                content={"success": False, "message": "db connection failed"},
+                content={"success": False, "message": "Database connection failed"},
             )
 
-        print(f"🔎 [home_login:user] db connection ok | username={username}")
         cursor = conn.cursor()
         user = None
         try:
             lock_col = _resolve_nrm_logins_lock_column(cursor)
             lock_select = f", l.{lock_col} AS ACCOUNT_LOCK_FLAG" if lock_col else ""
-
-            print(
-                "🔎 [home_login:user] executing lookup | "
-                f"username={username} login_type={login_type} lock_col={lock_col}"
-            )
 
             cursor.execute(
                 f"""
@@ -669,7 +650,6 @@ async def home_login(
             _cols = [c[0] for c in cursor.description]
             _row = cursor.fetchone()
             user = dict(zip(_cols, _row)) if _row else None
-            print(f"🔎 [home_login:user] lookup result | found={bool(user)}")
 
             if not user:
                 print(f"❌ [home_login:user] user not found | username={username}")
@@ -690,55 +670,27 @@ async def home_login(
 
             db_password = user.get("PASSWORD") or ""
             if not db_password:
-                print(f"❌ [home_login:user] empty password returned | user_id={user.get('ID')} username={username}")
+                print(f"❌ [home_login:user] empty password stored | user_id={user.get('ID')} username={username}")
                 return JSONResponse(
                     status_code=500,
-                    content={"success": False, "message": "Login error"},
+                    content={"success": False, "message": "Login error: no password record found"},
                 )
 
-            print(
-                "🔎 Login row selected | "
-                f"login_type=user user_id={user.get('ID')} username={username} "
-                f"row_created_at={user.get('LOGIN_ROW_CREATED_AT')} "
-                f"row_updated_at={user.get('LOGIN_ROW_UPDATED_AT')} "
-                f"row_is_active={user.get('LOGIN_ROW_IS_ACTIVE')}"
-            )
-
             password_format = "hashed" if db_password.startswith(("scrypt:", "pbkdf2:")) else "plain"
-            hash_scheme = db_password.split(":", 1)[0] if password_format == "hashed" else "plain-text"
-            db_has_outer_spaces = db_password != db_password.strip()
-
             try:
                 if password_format == "hashed":
                     valid = check_password_hash(db_password, password)
                 else:
                     valid = db_password == password
-                print(
-                    "🔎 [home_login:user] password check complete | "
-                    f"user_id={user.get('ID')} valid={valid} scheme={hash_scheme}"
-                )
             except Exception as exc:
-                print(
-                    "❌ Password verify error | "
-                    f"login_type=user user_id={user.get('ID')} username={username} "
-                    f"scheme={hash_scheme} db_len={len(db_password)} input_len={len(password)} "
-                    f"db_outer_spaces={db_has_outer_spaces} error={exc}"
-                )
+                print(f"❌ Password verification exception: {exc}")
                 valid = False
 
             if not valid:
-                print(
-                    "⚠️ Invalid credentials | "
-                    f"login_type=user user_id={user.get('ID')} username={username} "
-                    f"row_created_at={user.get('LOGIN_ROW_CREATED_AT')} row_updated_at={user.get('LOGIN_ROW_UPDATED_AT')} "
-                    f"scheme={hash_scheme} db_len={len(db_password)} input_len={len(password)} "
-                    f"db_outer_spaces={db_has_outer_spaces} "
-                    f"input_is_default_pw={password == 'changeme123'} "
-                    f"db_hash_prefix={db_password[:20]!r}"
-                )
+                print(f"⚠️ Invalid password for user {username}")
                 return JSONResponse(
                     status_code=401,
-                    content={"success": False, "message": "Invalid credentials"},
+                    content={"success": False, "message": "Incorrect password"},
                 )
 
             cursor.execute(
@@ -752,7 +704,7 @@ async def home_login(
                 (user["ID"],),
             )
             conn.commit()
-            print(f"✅ User login successful, IS_ACTIVE=Y: {username}")
+            print(f"✅ User login successful: {username}")
 
         finally:
             try:
@@ -770,48 +722,35 @@ async def home_login(
             "profile_pic": user.get("PROFILE_PIC"),
         }
         try:
-            # Store canonical session in DB 0 as session:{user_id}
-            print(f"📦 [home_login:user] writing session/profile/auth caches | user_id={user['ID']}")
             _session_set(int(user["ID"]), profile, ttl=86400)
-            # Store profile cache in DB 1 as user:{user_id}
             _profile_set(int(user["ID"]), profile, ttl=1800)
-            # Store authorization cache in DB 2 as roles:{user_id}
             _auth_set(
                 int(user["ID"]),
                 [str((user.get("USERTYPE") or "user")).lower()],
                 str((user.get("USERTYPE") or "user")).lower(),
                 ttl=3600,
             )
-            # Store login API response in DB 5
             _apicache_set(f"home:user:{user['ID']}", profile, ttl=300)
         except Exception as e:
-            print(f"Session proxy write error: {e}")
-
-        print(
-            "✅ [home_login:user] response prepared | "
-            f"user_id={user['ID']} email={user.get('EMAIL')} phone={user.get('PHONE')}"
-        )
+            print(f"Session proxy write warning: {e}")
 
         return {"success": True, "login_type": "user", "user": profile}
 
     # ------------------------------------------------------------------
-    # Employee login
+    # 2. Employee login (Staff & Operations) - Case-Insensitive ID & Email
     # ------------------------------------------------------------------
     if login_type == "employee":
-        employee_lookup = employee_id or username
-        print(f"🔐 [emp-login] START lookup={employee_lookup!r}")
+        employee_lookup = (employee_id or username).strip()
         conn = get_db_connection()
         if not conn:
-            print("❌ [emp-login] DB connection failed")
             return JSONResponse(
                 status_code=500,
-                content={"success": False, "message": "db connection failed"},
+                content={"success": False, "message": "Database connection failed"},
             )
 
-        print("✅ [emp-login] DB connection OK")
         cursor = conn.cursor()
         try:
-            print("🔎 [emp-login] Executing SELECT on EMP_NRM_EMPLOYEES JOIN EMP_NRM_LOGINS")
+            # Case-insensitive comparison on both EMPLOYEE_ID and EMAIL
             cursor.execute("""
                 SELECT
                     e.EMPLOYEE_ID,
@@ -820,7 +759,7 @@ async def home_login(
                     l.PASSWORD
                 FROM EMP_NRM_EMPLOYEES e
                 JOIN EMP_NRM_LOGINS l ON e.EMPLOYEE_ID = l.EMPLOYEE_ID
-                WHERE e.EMPLOYEE_ID = :1 OR LOWER(e.EMAIL) = LOWER(:2)
+                WHERE UPPER(e.EMPLOYEE_ID) = UPPER(:1) OR LOWER(e.EMAIL) = LOWER(:2)
                 ORDER BY e.EMPLOYEE_ID DESC
                 FETCH FIRST 1 ROWS ONLY
             """, (employee_lookup, employee_lookup))
@@ -828,49 +767,37 @@ async def home_login(
             _cols = [c[0] for c in cursor.description]
             _row = cursor.fetchone()
             emp = dict(zip(_cols, _row)) if _row else None
-            print(f"🔎 [emp-login] fetchone result: {'found' if emp else 'None'}")
 
             if not emp:
-                print(f"❌ [emp-login] Employee not found: {employee_lookup!r}")
+                print(f"❌ Employee not found: {employee_lookup}")
                 return JSONResponse(
                     status_code=404,
                     content={"success": False, "message": "Employee not found"},
                 )
 
-            db_password = emp.get("PASSWORD")
-            print(f"🔎 [emp-login] emp keys={list(emp.keys())} password_present={'yes' if db_password else 'no'} password_len={len(db_password) if db_password else 0}")
-
+            db_password = emp.get("PASSWORD") or ""
             if not db_password:
-                print("❌ [emp-login] No password stored for employee")
                 return JSONResponse(
                     status_code=500,
-                    content={"success": False, "message": "Login error"},
+                    content={"success": False, "message": "Login error: no password record found"},
                 )
 
-            # ✅ Password check
             pw_format = "hashed" if db_password.startswith(("scrypt:", "pbkdf2:")) else "plain"
-            print(f"🔎 [emp-login] pw_format={pw_format} db_pw_prefix={db_password[:20]!r}")
             try:
                 if pw_format == "hashed":
                     valid = check_password_hash(db_password, password)
                 else:
                     valid = db_password == password
-                print(f"🔎 [emp-login] password_valid={valid}")
             except Exception as exc:
-                print(f"❌ [emp-login] Password verification error: {exc}")
-                traceback.print_exc()
+                print(f"❌ Employee password verification error: {exc}")
                 valid = False
 
             if not valid:
-                print(f"❌ [emp-login] Invalid credentials for {employee_lookup!r} pw_format={pw_format}")
                 return JSONResponse(
                     status_code=401,
-                    content={"success": False, "message": "Invalid credentials"},
+                    content={"success": False, "message": "Incorrect password"},
                 )
 
-            # Mark active employee session using available schema.
-            # EMP_NRM_LOGINS has no IS_ACTIVE/LAST_LOGIN/UPDATED_AT columns.
-            print("🔎 [emp-login] Running UPDATE LOGOUT_TIME=NULL")
             cursor.execute(
                 """
                 UPDATE EMP_NRM_LOGINS
@@ -880,9 +807,8 @@ async def home_login(
                 (emp["EMPLOYEE_ID"],),
             )
             conn.commit()
-            print(f"✅ [emp-login] Login success for employee_id={emp['EMPLOYEE_ID']}")
+            print(f"✅ Employee login successful: {emp['EMPLOYEE_ID']}")
 
-            # ✅ Success
             return {
                 "success": True,
                 "login_type": "employee",
@@ -894,34 +820,27 @@ async def home_login(
             }
 
         except Exception as e:
-            print(f"❌ [emp-login] EXCEPTION: {type(e).__name__}: {e}")
             traceback.print_exc()
             return JSONResponse(
                 status_code=500,
-                content={"success": False, "message": f"Employee login failed: {type(e).__name__}: {e}"},
+                content={"success": False, "message": f"Employee login failed: {e}"},
             )
         finally:
             try:
                 cursor.close()
-            except Exception:
-                pass
-            try:
                 conn.close()
             except Exception:
                 pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Secure PIN — mobile device login (Screen 2)
-# Password authenticates the user once; PIN authenticates that trusted device.
+# SECURE PIN — Mobile Device Login
 # ══════════════════════════════════════════════════════════════════════════
-
 PIN_MAX_FAILED_ATTEMPTS = int(os.getenv("PIN_MAX_FAILED_ATTEMPTS", "5"))
 
 
 @app.post("/home/pin/setup")
 async def pin_setup(payload: PinSetupRequest):
-    """Create or replace the Secure PIN for a (user_id, device_id) pair."""
     pin = (payload.pin or "").strip()
     if not pin.isdigit() or len(pin) != 6:
         return JSONResponse(
@@ -933,13 +852,12 @@ async def pin_setup(payload: PinSetupRequest):
     if not conn:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "message": "db connection failed"},
+            content={"success": False, "message": "Database connection failed"},
         )
 
     cursor = conn.cursor()
     try:
         pin_hash = generate_password_hash(pin)
-
         cursor.execute(
             """
             MERGE INTO NRM_USER_DEVICE_PIN t
@@ -965,12 +883,9 @@ async def pin_setup(payload: PinSetupRequest):
             },
         )
         conn.commit()
-        print(f"✅ [pin-setup] PIN saved | user_id={payload.user_id} device_id={payload.device_id}")
-
         return {"success": True, "message": "Secure PIN set up successfully"}
 
     except Exception as e:
-        print(f"❌ [pin-setup] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
@@ -979,9 +894,6 @@ async def pin_setup(payload: PinSetupRequest):
     finally:
         try:
             cursor.close()
-        except Exception:
-            pass
-        try:
             conn.close()
         except Exception:
             pass
@@ -989,7 +901,6 @@ async def pin_setup(payload: PinSetupRequest):
 
 @app.post("/home/pin/login")
 async def pin_login(payload: PinLoginRequest):
-    """Authenticate a trusted device using its Secure PIN."""
     pin = (payload.pin or "").strip()
     if not pin:
         return JSONResponse(
@@ -1001,7 +912,7 @@ async def pin_login(payload: PinLoginRequest):
     if not conn:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "message": "db connection failed"},
+            content={"success": False, "message": "Database connection failed"},
         )
 
     cursor = conn.cursor()
@@ -1017,7 +928,6 @@ async def pin_login(payload: PinLoginRequest):
         row = cursor.fetchone()
 
         if not row:
-            print(f"❌ [pin-login] no PIN registered | user_id={payload.user_id} device_id={payload.device_id}")
             return JSONResponse(
                 status_code=404,
                 content={"success": False, "message": "No Secure PIN set up on this device"},
@@ -1026,7 +936,6 @@ async def pin_login(payload: PinLoginRequest):
         record_id, pin_hash, failed_attempts, is_active = row
 
         if str(is_active).strip().upper() != "Y":
-            print(f"🔒 [pin-login] device locked | user_id={payload.user_id} device_id={payload.device_id}")
             return JSONResponse(
                 status_code=403,
                 content={"success": False, "message": "Device is locked. Please log in with your password."},
@@ -1036,7 +945,7 @@ async def pin_login(payload: PinLoginRequest):
         try:
             valid = check_password_hash(pin_hash, pin)
         except Exception as exc:
-            print(f"❌ [pin-login] hash check error: {exc}")
+            print(f"❌ PIN hash check error: {exc}")
 
         if not valid:
             new_failed = int(failed_attempts or 0) + 1
@@ -1052,10 +961,7 @@ async def pin_login(payload: PinLoginRequest):
                 (new_failed, "N" if lock_now else "Y", record_id),
             )
             conn.commit()
-            print(
-                f"⚠️ [pin-login] invalid PIN | user_id={payload.user_id} device_id={payload.device_id} "
-                f"failed_attempts={new_failed} locked={lock_now}"
-            )
+
             if lock_now:
                 return JSONResponse(
                     status_code=403,
@@ -1066,7 +972,6 @@ async def pin_login(payload: PinLoginRequest):
                 content={"success": False, "message": "Incorrect PIN"},
             )
 
-        # Success — reset failed attempts, stamp LAST_USED
         cursor.execute(
             """
             UPDATE NRM_USER_DEVICE_PIN
@@ -1088,7 +993,6 @@ async def pin_login(payload: PinLoginRequest):
         conn.commit()
 
         if not user:
-            print(f"❌ [pin-login] user not found after PIN match | user_id={payload.user_id}")
             return JSONResponse(
                 status_code=404,
                 content={"success": False, "message": "User not found"},
@@ -1103,8 +1007,6 @@ async def pin_login(payload: PinLoginRequest):
             "profile_pic": user.get("PROFILE_PIC"),
         }
         try:
-            # Same session/profile/auth cache writes as /home/login, so a PIN
-            # session looks identical downstream to a password session.
             _session_set(int(user["ID"]), profile, ttl=86400)
             _profile_set(int(user["ID"]), profile, ttl=1800)
             _auth_set(
@@ -1114,13 +1016,11 @@ async def pin_login(payload: PinLoginRequest):
                 ttl=3600,
             )
         except Exception as e:
-            print(f"Session proxy write error [pin-login]: {e}")
+            print(f"Session proxy write error: {e}")
 
-        print(f"✅ [pin-login] success | user_id={payload.user_id} device_id={payload.device_id}")
         return {"success": True, "login_type": "pin", "user": profile}
 
     except Exception as e:
-        print(f"❌ [pin-login] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
@@ -1129,9 +1029,6 @@ async def pin_login(payload: PinLoginRequest):
     finally:
         try:
             cursor.close()
-        except Exception:
-            pass
-        try:
             conn.close()
         except Exception:
             pass
@@ -1139,7 +1036,6 @@ async def pin_login(payload: PinLoginRequest):
 
 @app.post("/home/pin/reset")
 async def pin_reset(payload: PinResetRequest):
-    """Reset the Secure PIN for a device — requires full email+password re-auth."""
     new_pin = (payload.new_pin or "").strip()
     if not new_pin.isdigit() or len(new_pin) != 6:
         return JSONResponse(
@@ -1151,12 +1047,11 @@ async def pin_reset(payload: PinResetRequest):
     if not conn:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "message": "db connection failed"},
+            content={"success": False, "message": "Database connection failed"},
         )
 
     cursor = conn.cursor()
     try:
-        # Re-verify identity the same way /home/login does.
         cursor.execute(
             """
             SELECT u.ID, l.PASSWORD
@@ -1212,12 +1107,9 @@ async def pin_reset(payload: PinResetRequest):
             {"user_id": user_id, "device_id": payload.device_id, "pin_hash": pin_hash},
         )
         conn.commit()
-        print(f"✅ [pin-reset] PIN reset | user_id={user_id} device_id={payload.device_id}")
-
         return {"success": True, "message": "Secure PIN reset successfully"}
 
     except Exception as e:
-        print(f"❌ [pin-reset] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
@@ -1226,9 +1118,6 @@ async def pin_reset(payload: PinResetRequest):
     finally:
         try:
             cursor.close()
-        except Exception:
-            pass
-        try:
             conn.close()
         except Exception:
             pass
@@ -1236,12 +1125,11 @@ async def pin_reset(payload: PinResetRequest):
 
 @app.get("/home/pin/status")
 async def pin_status(user_id: int, device_id: str):
-    """Tell the app whether this device already has a Secure PIN set up."""
     conn = get_db_connection()
     if not conn:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "message": "db connection failed"},
+            content={"success": False, "message": "Database connection failed"},
         )
 
     cursor = conn.cursor()
@@ -1256,7 +1144,6 @@ async def pin_status(user_id: int, device_id: str):
         exists = cursor.fetchone() is not None
         return {"success": True, "pin_exists": exists}
     except Exception as e:
-        print(f"❌ [pin-status] EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
@@ -1265,14 +1152,14 @@ async def pin_status(user_id: int, device_id: str):
     finally:
         try:
             cursor.close()
-        except Exception:
-            pass
-        try:
             conn.close()
         except Exception:
             pass
 
 
+# ==============================================================================
+# FORGOT & RESET PASSWORD
+# ==============================================================================
 @app.post("/home/forgot-password")
 async def home_forgot_password(payload: ForgotPasswordRequest):
     login_type = (payload.login_type or "").strip().lower()
@@ -1333,15 +1220,8 @@ async def home_forgot_password(payload: ForgotPasswordRequest):
 
         _send_reset_email(email, link)
 
-        return {
-            "success": True,
-            "message": "Reset link sent to mail",
-        }
+        return {"success": True, "message": "Reset link sent to mail"}
     except Exception as exc:
-        print(
-            "❌ Forgot password error | "
-            f"login_type={login_type} username={username} error={exc}"
-        )
         return JSONResponse(
             status_code=503,
             content={"success": False, "message": f"Unable to send reset email: {exc}"},
@@ -1375,7 +1255,6 @@ async def validate_reset_token(token: str):
             content={"success": False, "message": "Invalid reset link"},
         )
     except Exception as exc:
-        print(f"❌ Reset token validation error: {exc}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "message": "Token validation failed"},
@@ -1465,7 +1344,6 @@ async def home_reset_password(token: str, payload: ResetPasswordRequest):
 
         return {"success": True, "message": "Password reset successful"}
     except Exception as exc:
-        print(f"❌ Reset password error: {exc}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "message": "Password reset failed"},
@@ -1479,11 +1357,11 @@ async def home_reset_password(token: str, payload: ResetPasswordRequest):
             pass
 
 
-# ==================== LOGOUT ROUTES ====================
-
+# ==============================================================================
+# LOGOUT ROUTES
+# ==============================================================================
 @app.post("/home/logout/user")
 async def user_logout(request: Request):
-    """Handle user logout - set IS_ACTIVE='N' and record LOGOUT_TIME."""
     data = await _get_request_data(request)
     user_id = data.get("user_id")
 
@@ -1503,7 +1381,6 @@ async def user_logout(request: Request):
             )
 
         cursor = conn.cursor()
-
         cursor.execute(
             """
             UPDATE NRM_LOGINS
@@ -1514,61 +1391,13 @@ async def user_logout(request: Request):
             """,
             (user_id,),
         )
-
         rows_updated = cursor.rowcount
         conn.commit()
 
-        if rows_updated <= 0:
-            print(f"⚠️ Logout update matched no rows in NRM_LOGINS for USER_ID={user_id}")
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "success": False,
-                    "message": "No NRM_LOGINS row updated during logout",
-                    "user_id": user_id,
-                    "rows_updated": rows_updated,
-                },
-            )
-
-        cursor.execute(
-            """
-            SELECT USER_ID, IS_ACTIVE, LAST_LOGIN, LOGOUT_TIME, UPDATED_AT
-            FROM NRM_LOGINS
-            WHERE USER_ID = :1
-            ORDER BY UPDATED_AT DESC NULLS LAST
-            FETCH FIRST 1 ROWS ONLY
-            """,
-            (user_id,),
-        )
-        _cols = [c[0] for c in cursor.description]
-        _row = cursor.fetchone()
-        updated_row = dict(zip(_cols, _row)) if _row else None
-
-        if not updated_row or (updated_row.get("IS_ACTIVE") or "").upper() != "N":
-            print(f"❌ Logout verification failed for USER_ID={user_id}: {updated_row}")
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "message": "Logout verification failed",
-                    "user_id": user_id,
-                    "row": updated_row,
-                },
-            )
-
         try:
-            # Remove only canonical session from DB 0 on logout.
-            # Keep profile/auth/api caches to speed up subsequent logins.
             _session_delete(int(user_id))
-        except Exception as cache_exc:
-            print(
-                f"⚠️ Session delete proxy failed on logout for USER_ID={user_id}: {cache_exc}"
-            )
-
-        print(
-            f"✅ User logout verified: USER_ID={user_id}, rows_updated={rows_updated}, "
-            f"IS_ACTIVE={updated_row.get('IS_ACTIVE')}, LOGOUT_TIME={updated_row.get('LOGOUT_TIME')}"
-        )
+        except Exception:
+            pass
 
         cursor.close()
         conn.close()
@@ -1578,12 +1407,9 @@ async def user_logout(request: Request):
             "message": "Logout successful",
             "user_id": user_id,
             "rows_updated": rows_updated,
-            "is_active": updated_row.get("IS_ACTIVE"),
-            "logout_time": str(updated_row.get("LOGOUT_TIME")) if updated_row.get("LOGOUT_TIME") else None,
         }
 
     except Exception as e:
-        print(f"❌ User logout error: {e}")
         if conn:
             conn.rollback()
         return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
@@ -1597,7 +1423,6 @@ async def user_logout(request: Request):
 
 @app.post("/home/logout/employee")
 async def employee_logout(request: Request):
-    """Handle employee logout by recording LOGOUT_TIME for EMP_NRM_LOGINS."""
     data = await _get_request_data(request)
     employee_id = data.get("employee_id")
 
@@ -1617,7 +1442,6 @@ async def employee_logout(request: Request):
             )
 
         cursor = conn.cursor()
-
         cursor.execute(
             """
             UPDATE EMP_NRM_LOGINS
@@ -1626,11 +1450,8 @@ async def employee_logout(request: Request):
             """,
             (employee_id,),
         )
-
         rows_updated = cursor.rowcount
         conn.commit()
-
-        print(f"✅ Employee logout successful: EMPLOYEE_ID={employee_id}, rows_updated={rows_updated}")
 
         cursor.close()
         conn.close()
@@ -1642,7 +1463,6 @@ async def employee_logout(request: Request):
         }
 
     except Exception as e:
-        print(f"❌ Employee logout error: {e}")
         if conn:
             conn.rollback()
         return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
@@ -1654,9 +1474,11 @@ async def employee_logout(request: Request):
                 pass
 
 
+# ==============================================================================
+# CONTENT ENDPOINTS: BATCHES, FEEDBACK, ENQUIRIES, BLOGS, CLIENTS
+# ==============================================================================
 @app.get("/home/active-users")
 async def get_active_users():
-    """Get count of currently active users."""
     conn = None
     try:
         conn = get_db_connection()
@@ -1667,50 +1489,11 @@ async def get_active_users():
             )
 
         cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT COUNT(*) as active_users
-            FROM NRM_LOGINS
-            WHERE IS_ACTIVE = 'Y'
-            """
-        )
+        cursor.execute("SELECT COUNT(*) as active_users FROM NRM_LOGINS WHERE IS_ACTIVE = 'Y'")
         user_count = cursor.fetchone()[0]
 
-        cursor.execute(
-            """
-            SELECT COUNT(*) as active_employees
-            FROM EMP_NRM_LOGINS
-            WHERE LOGOUT_TIME IS NULL
-            """
-        )
+        cursor.execute("SELECT COUNT(*) as active_employees FROM EMP_NRM_LOGINS WHERE LOGOUT_TIME IS NULL")
         employee_count = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            SELECT
-                l.USER_ID,
-                u.FULL_NAME,
-                u.EMAIL,
-                l.LAST_LOGIN,
-                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(l.LAST_LOGIN AS DATE)) * 24 * 60) as minutes_since_login
-            FROM NRM_LOGINS l
-            JOIN NRM_USERS u ON l.USER_ID = u.ID
-            WHERE l.IS_ACTIVE = 'Y'
-            ORDER BY l.LAST_LOGIN DESC
-            """
-        )
-        active_users = []
-        for row in cursor.fetchall():
-            active_users.append(
-                {
-                    "user_id": row[0],
-                    "name": row[1],
-                    "email": row[2],
-                    "last_login": str(row[3]) if row[3] else None,
-                    "minutes_since_login": row[4],
-                }
-            )
 
         cursor.close()
         conn.close()
@@ -1720,11 +1503,9 @@ async def get_active_users():
             "active_user_count": user_count,
             "active_employee_count": employee_count,
             "total_active": user_count + employee_count,
-            "active_users": active_users,
         }
 
     except Exception as e:
-        print(f"❌ Get active users error: {e}")
         return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
     finally:
         if conn:
@@ -1736,19 +1517,10 @@ async def get_active_users():
 
 @app.get("/home/batches")
 async def get_batches():
-    """
-    Returns current and upcoming batches.
-    Cache key : home:batches  (DB 5, TTL 10 min)
-    Cache MISS → query Oracle → store in home cache → return.
-    """
-    start_time = time.time()
-
     cached = home_cache_get("batches")
     if cached:
-        print(f"⏱️ batches served from cache ({time.time() - start_time:.3f}s)")
         return cached
 
-    print("❄️ Cache MISS for home:batches — querying Oracle")
     conn = get_db_connection()
     if not conn:
         return {"success": False, "current_batches": [], "upcoming_batches": []}
@@ -1804,8 +1576,7 @@ async def get_batches():
             "upcoming_batches": upcoming_batches,
         }
 
-        home_cache_set("batches", response_data)   # TTL = 10 min (default)
-        print(f"⏱️ batches total time: {time.time() - start_time:.2f}s")
+        home_cache_set("batches", response_data)
         return response_data
 
     except Exception as e:
@@ -1819,27 +1590,18 @@ async def get_batches():
 
 @app.get("/home/feedbacks")
 async def get_feedback():
-    """
-    Returns recent student feedback.
-    Cache key : home:feedback  (DB 5, TTL 5 min)
-    Cache MISS -> query Oracle -> store in home cache -> return.
-    """
-    start_time = time.time()
-
+    """Returns recent student feedback (Fixed for Oracle DB NULL semantics)."""
     cached_data = home_cache_get("feedback")
     if cached_data:
-        print(f"[TIME]️ feedbacks served from cache ({time.time() - start_time:.3f}s)")
         return cached_data
-
-    print("❄️ Cache MISS for home:feedback -- querying Oracle")
 
     conn = get_db_connection()
     if not conn:
         return {"success": False, "feedbacks": []}
 
     cursor = conn.cursor()
-
     try:
+        # Fixed: TRIM(f.FEEDBACK_MESSAGE) IS NOT NULL ensures rows with text are returned in Oracle
         cursor.execute(
             """
             SELECT
@@ -1849,26 +1611,19 @@ async def get_feedback():
                     'Anonymous'
                 ) AS username,
                 f.FEEDBACK_MESSAGE
-                        FROM "CHAKORA"."NRM_FEEDBACK" f
-                        LEFT JOIN "CHAKORA"."NRM_USERS" u
-                ON f.STUDENT_ID = u.ID
+            FROM "CHAKORA"."NRM_FEEDBACK" f
+            LEFT JOIN "CHAKORA"."NRM_USERS" u ON f.STUDENT_ID = u.ID
             WHERE f.FEEDBACK_MESSAGE IS NOT NULL
-              AND TRIM(f.FEEDBACK_MESSAGE) <> ''
+              AND TRIM(f.FEEDBACK_MESSAGE) IS NOT NULL
             ORDER BY f.SUBMITTED_AT DESC
-                        FETCH FIRST 20 ROWS ONLY
+            FETCH FIRST 20 ROWS ONLY
             """
         )
 
         rows = cursor.fetchall()
-
-        feedbacks = []
-        for row in rows:
-            feedbacks.append({"username": row[0], "feedback_message": row[1]})
-
+        feedbacks = [{"username": row[0], "feedback_message": row[1]} for row in rows]
         response_data = {"success": True, "feedbacks": feedbacks}
-
-        home_cache_set("feedback", response_data)  # TTL = 5 min (default)
-        print(f"[TIME]️ feedbacks total time: {time.time() - start_time:.2f}s")
+        home_cache_set("feedback", response_data)
         return response_data
 
     except Exception as e:
@@ -1886,8 +1641,6 @@ async def enquiry(request: Request):
     conn = None
     try:
         data = await _get_request_data(request)
-        print("🏠 [HOME] enquiry:", data)
-
         if not data:
             return JSONResponse(
                 status_code=400,
@@ -1902,7 +1655,6 @@ async def enquiry(request: Request):
             )
 
         cursor = conn.cursor()
-
         user_id = data.get("user_id")
         name = data.get("name")
         email = data.get("email")
@@ -1916,7 +1668,6 @@ async def enquiry(request: Request):
             )
 
         is_guest = True if not user_id else False
-
         cursor.execute(
             """
             INSERT INTO NRM_ENQUIRIES
@@ -1925,9 +1676,7 @@ async def enquiry(request: Request):
             """,
             (user_id, name, email, phone, enquiry_text, is_guest),
         )
-
         conn.commit()
-
         return {"success": True, "message": "Enquiry submitted successfully"}
 
     except Exception as e:
@@ -1936,7 +1685,6 @@ async def enquiry(request: Request):
             status_code=500,
             content={"success": False, "message": "Server error"},
         )
-
     finally:
         try:
             if cursor:
@@ -1949,13 +1697,7 @@ async def enquiry(request: Request):
 
 @app.get("/home/gallery")
 async def get_gallery_items():
-    """
-    Returns gallery items.
-    Cache key : home:about  — gallery is part of the 'about' section family.
-    TTL 15 min (rarely changes).
-    """
-    cache_key = "about"   # maps to home:about
-
+    cache_key = "about"
     cached_data = home_cache_get(cache_key)
     if cached_data:
         return cached_data
@@ -1972,15 +1714,12 @@ async def get_gallery_items():
             }
         ],
     }
-
-    home_cache_set(cache_key, response_data)  # TTL = 15 min (default)
-
+    home_cache_set(cache_key, response_data)
     return response_data
 
 
 @app.get("/home/blogs")
 async def get_blog_items():
-    """Returns community/blog content for mobile app."""
     return {
         "success": True,
         "posts": [
@@ -2008,44 +1747,26 @@ async def get_blog_items():
 
 @app.get("/home/clients")
 async def get_clients_items():
-    """Returns clients/projects/testimonials for mobile community screen."""
     return {
         "success": True,
-        "clients": [
-            "Acme Corp",
-            "Globex Inc",
-            "Initech",
-        ],
-        "projects": [
-            "Student Portal Revamp",
-            "Internal Analytics Dashboard",
-        ],
+        "clients": ["Acme Corp", "Globex Inc", "Initech"],
+        "projects": ["Student Portal Revamp", "Internal Analytics Dashboard"],
         "testimonials": [
-            {
-                "name": "Priya S.",
-                "quote": "The training program helped me land my first job.",
-            },
-            {
-                "name": "Arjun K.",
-                "quote": "Hands-on projects made all the difference.",
-            },
+            {"name": "Priya S.", "quote": "The training program helped me land my first job."},
+            {"name": "Arjun K.", "quote": "Hands-on projects made all the difference."},
         ],
     }
 
 
-# ── Cache management endpoints (admin / internal use) ────────────────────────
-
 @app.delete("/home/cache/invalidate")
 async def invalidate_home_cache(section: str = "batches"):
-    """
-    Admin endpoint to manually bust a home-page cache section.
-    section: batches | feedback | offers | about | * (all)
-    Example: DELETE /home/cache/invalidate?section=batches
-    """
     home_cache_delete(section)
     label = f"home:{section}" if section != "*" else "home:*"
     return {"success": True, "message": f"Cache invalidated: {label}"}
 
 
+# ==============================================================================
+# ENTRYPOINT (Port 5001)
+# ==============================================================================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5001)
