@@ -1,10 +1,13 @@
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
 import oracledb
+oracledb.defaults.fetch_lobs = False  # CLOB/BLOB come back as str/bytes, JSON-safe
 import traceback
 from werkzeug.security import check_password_hash, generate_password_hash
 import json
 import time
+import secrets
+import threading
 import uvicorn
 from pydantic import BaseModel
 from typing import Optional
@@ -67,6 +70,7 @@ def _get_env_value(name: str, default: str = "") -> str:
 
 
 app = FastAPI(title="home_service", version="1.0")
+print("🟢 home_service build: lob-fix + otp-debug v5 (role-based html otp mail) loaded")
 
 
 @app.exception_handler(Exception)
@@ -95,6 +99,20 @@ class ForgotPasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     password: str
+
+
+class VerifyMFARequest(BaseModel):
+    challenge_id: str
+    otp: str
+
+
+# MFA challenges are short-lived and one-time. For multi-worker production deployments,
+# move this store to a shared backend such as Redis.
+_MFA_CHALLENGES = {}
+_MFA_CHALLENGES_LOCK = threading.Lock()
+MFA_OTP_TTL_SECONDS = int(os.getenv("MFA_OTP_TTL_SECONDS", "300"))
+MFA_MAX_ATTEMPTS = int(os.getenv("MFA_MAX_ATTEMPTS", "5"))
+MFA_MAX_RESENDS = int(os.getenv("MFA_MAX_RESENDS", "3"))
 
 
 # ── Secure PIN (mobile device login) request models ──────────────────────────
@@ -581,6 +599,184 @@ async def health_check():
 
 
 # ==============================================================================
+# EMAIL MFA HELPERS
+# ==============================================================================
+def _build_mfa_email(otp: str, login_type: str, display_name: str = ""):
+    """Return (subject, plain_text, html) for the login OTP mail, worded per account type."""
+    import html as _html
+    is_emp = (login_type or "").lower() == "employee"
+    role = "Employee" if is_emp else "Student"
+    minutes = MFA_OTP_TTL_SECONDS // 60 or 1
+    name = (display_name or "").strip()
+    greeting = f"Hello {name}," if name else "Hello,"
+    subject = f"ChakoraHub {role} Login OTP"
+
+    text = (
+        f"ChakoraHub - {role} Login Verification\n\n"
+        f"{greeting}\n\n"
+        f"Use the one-time password (OTP) below to complete your {role.lower()} login:\n\n"
+        f"    {otp}\n\n"
+        f"This OTP is valid for {minutes} minute(s). Do not share it with anyone.\n"
+        "ChakoraHub will never ask you for this code by phone, chat or email.\n\n"
+        "If you did not try to log in, please ignore this email. Your account remains secure.\n\n"
+        "Regards,\nChakoraHub Team\nadmin@chakorahub.com"
+    )
+
+    safe_name = _html.escape(name)
+    greet_html = f"Hello <strong>{safe_name}</strong>," if safe_name else "Hello,"
+    html_body = f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Segoe UI,Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="560" cellspacing="0" cellpadding="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb;">
+        <tr>
+          <td style="background:#0b5ed7;padding:22px 28px;color:#ffffff;">
+            <div style="font-size:22px;font-weight:700;letter-spacing:.3px;">ChakoraHub</div>
+            <div style="font-size:13px;opacity:.9;margin-top:2px;">{role} Login Verification</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px;color:#1f2937;font-size:15px;line-height:1.6;">
+            <p style="margin:0 0 14px;">{greet_html}</p>
+            <p style="margin:0 0 18px;">Use the one-time password (OTP) below to complete your <strong>{role.lower()} login</strong> to ChakoraHub.</p>
+            <div style="text-align:center;margin:22px 0;">
+              <span style="display:inline-block;background:#eef4ff;border:1px dashed #0b5ed7;border-radius:8px;padding:14px 28px;font-size:32px;font-weight:700;letter-spacing:8px;color:#0b5ed7;">{otp}</span>
+            </div>
+            <p style="margin:0 0 6px;">This OTP is valid for <strong>{minutes} minute(s)</strong> and can be used only once.</p>
+            <p style="margin:0 0 18px;color:#b91c1c;font-size:13px;"><strong>Do not share this code with anyone.</strong> ChakoraHub will never ask for it by phone, chat or email.</p>
+            <p style="margin:0;color:#6b7280;font-size:13px;">If you did not try to log in, you can safely ignore this email. Your account remains secure.</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f9fafb;padding:16px 28px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px;">
+            Regards,<br><strong>ChakoraHub Team</strong><br>
+            This is an automated message, please do not reply.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+    return subject, text, html_body
+
+
+def _send_mfa_otp_email(to_email: str, otp: str, login_type: str = "user", display_name: str = "") -> None:
+    """Send a short-lived login OTP; in local dev (MFA_DEV_LOG_OTP=1) fall back to console."""
+    try:
+        _send_mfa_otp_email_real(to_email, otp, login_type, display_name)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        if os.getenv("MFA_DEV_LOG_OTP") == "1":
+            print(f"🔧 [DEV ONLY] OTP for {to_email}: {otp}")
+            return
+        raise
+
+
+def _send_mfa_otp_email_real(to_email: str, otp: str, login_type: str = "user", display_name: str = "") -> None:
+    recipient = (to_email or "").strip()
+    if not recipient or "@" not in recipient:
+        raise RuntimeError("A valid email address is required for MFA")
+
+    sender = (
+        os.getenv("RESET_EMAIL_SENDER")
+        or os.getenv("SES_SENDER")
+        or os.getenv("SMTP_USER")
+        or os.getenv("EMAIL_SENDER")
+        or os.getenv("FROM_EMAIL")
+        or os.getenv("ADMIN_EMAIL")
+        or "admin@chakorahub.com"
+    ).strip()
+    password = (os.getenv("RESET_EMAIL_PASSWORD") or os.getenv("SMTP_PASSWORD") or "").strip()
+    subject, body, html_body = _build_mfa_email(otp, login_type, display_name)
+
+    if sender and password:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = f"ChakoraHub <{sender}>"
+            msg["To"] = recipient
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+            with smtplib.SMTP((os.getenv("SMTP_HOST") or "smtp.gmail.com").strip(),
+                              int(os.getenv("SMTP_PORT") or "587")) as server:
+                server.starttls()
+                server.login(sender, password)
+                server.send_message(msg)
+            return
+        except Exception as exc:
+            print(f"⚠️ MFA SMTP send failed; trying SES fallback: {exc}")
+
+    if boto3 is not None:
+        ses_sender = (
+            os.getenv("RESET_EMAIL_SENDER")
+            or os.getenv("SES_SENDER")
+            or os.getenv("EMAIL_SENDER")
+            or os.getenv("FROM_EMAIL")
+            or os.getenv("ADMIN_EMAIL")
+            or sender
+        )
+        if ses_sender:
+            try:
+                region = (os.getenv("AWS_REGION") or os.getenv("SES_REGION") or "eu-north-1").strip()
+                kwargs = {"region_name": region}
+                access_key = (os.getenv("AWS_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID") or "").strip()
+                secret_key = (os.getenv("AWS_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY") or "").strip()
+                if access_key and secret_key:
+                    kwargs.update(aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+                boto3.client("ses", **kwargs).send_email(
+                    Source=ses_sender,
+                    Destination={"ToAddresses": [recipient]},
+                    Message={
+                        "Subject": {"Data": subject, "Charset": "UTF-8"},
+                        "Body": {
+                            "Text": {"Data": body, "Charset": "UTF-8"},
+                            "Html": {"Data": html_body, "Charset": "UTF-8"},
+                        },
+                    },
+                )
+                return
+            except Exception as exc:
+                raise RuntimeError(f"Unable to send MFA email: {exc}") from exc
+
+    raise RuntimeError("MFA email is not configured. Configure SMTP or AWS SES.")
+
+
+def _mask_mfa_email(email: str) -> str:
+    value = (email or "").strip()
+    if "@" not in value:
+        return ""
+    local, domain = value.split("@", 1)
+    return (local[:1] + "***@" + domain) if local else "***@" + domain
+
+
+def _create_mfa_challenge(login_type: str, email: str, profile: dict) -> dict:
+    """Email an OTP and store only its password hash, never the plaintext code."""
+    if not (email or "").strip():
+        raise RuntimeError("No email address is registered for this account")
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    challenge_id = secrets.token_urlsafe(32)
+    _display = (profile or {}).get("username") or (profile or {}).get("employee_name") or ""
+    _send_mfa_otp_email(email, otp, login_type, _display)
+    now = time.time()
+    challenge = {
+        "login_type": login_type,
+        "email": email,
+        "otp_hash": generate_password_hash(otp),
+        "profile": profile,
+        "created_at": now,
+        "expires_at": now + MFA_OTP_TTL_SECONDS,
+        "attempts": 0,
+        "resends": 0,
+    }
+    with _MFA_CHALLENGES_LOCK:
+        _MFA_CHALLENGES[challenge_id] = challenge
+    return {"challenge_id": challenge_id, "email_hint": _mask_mfa_email(email)}
+
+
+# ==============================================================================
 # AUTHENTICATION: LOGIN
 # ==============================================================================
 @app.post("/home/login")
@@ -693,16 +889,33 @@ async def home_login(
                     content={"success": False, "message": "Incorrect password"},
                 )
 
-            cursor.execute(
-                """
-                UPDATE NRM_LOGINS
-                SET IS_ACTIVE = 'Y',
-                    LAST_LOGIN = CURRENT_TIMESTAMP,
-                    UPDATED_AT = CURRENT_TIMESTAMP
-                WHERE USER_ID = :1
-                """,
-                (user["ID"],),
-            )
+            # Password is valid; require email MFA before activating the login or session.
+            profile = {
+                "id": user["ID"],
+                "username": user.get("USERNAME"),
+                "email": user.get("EMAIL"),
+                "phone": user.get("PHONE"),
+                "usertype": user.get("USERTYPE"),
+                "profile_pic": user.get("PROFILE_PIC"),
+            }
+            try:
+                _typed = (username or "").strip()
+                _otp_to = _typed if "@" in _typed else (user.get("EMAIL") or "")
+                challenge = _create_mfa_challenge("user", _otp_to, profile)
+            except Exception as mfa_exc:
+                print(f"❌ Student MFA challenge could not be created: {mfa_exc}")
+                return JSONResponse(
+                    status_code=503,
+                    content={"success": False, "message": "Unable to send login OTP. Please try again later."},
+                )
+            return {
+                "success": False,
+                "mfa_required": True,
+                "login_type": "user",
+                "challenge_id": challenge["challenge_id"],
+                "email_hint": challenge["email_hint"],
+                "message": "OTP sent to your registered email address.",
+            }
             conn.commit()
             print(f"✅ User login successful: {username}")
 
@@ -798,14 +1011,30 @@ async def home_login(
                     content={"success": False, "message": "Incorrect password"},
                 )
 
-            cursor.execute(
-                """
-                UPDATE EMP_NRM_LOGINS
-                SET LOGOUT_TIME = NULL
-                WHERE EMPLOYEE_ID = :1
-                """,
-                (emp["EMPLOYEE_ID"],),
-            )
+            # Password is valid; require email MFA before completing employee login.
+            employee_profile = {
+                "employee_id": emp["EMPLOYEE_ID"],
+                "employee_name": emp["EMPLOYEE_NAME"],
+                "email": emp["EMAIL"],
+            }
+            try:
+                _typed = (employee_lookup or "").strip()
+                _otp_to = _typed if "@" in _typed else (emp.get("EMAIL") or "")
+                challenge = _create_mfa_challenge("employee", _otp_to, employee_profile)
+            except Exception as mfa_exc:
+                print(f"❌ Employee MFA challenge could not be created: {mfa_exc}")
+                return JSONResponse(
+                    status_code=503,
+                    content={"success": False, "message": "Unable to send login OTP. Please try again later."},
+                )
+            return {
+                "success": False,
+                "mfa_required": True,
+                "login_type": "employee",
+                "challenge_id": challenge["challenge_id"],
+                "email_hint": challenge["email_hint"],
+                "message": "OTP sent to your registered email address.",
+            }
             conn.commit()
             print(f"✅ Employee login successful: {emp['EMPLOYEE_ID']}")
 
@@ -831,6 +1060,123 @@ async def home_login(
                 conn.close()
             except Exception:
                 pass
+
+
+@app.post("/home/verify-otp")
+async def home_verify_otp(payload: VerifyMFARequest):
+    challenge_id = (payload.challenge_id or "").strip()
+    otp = (payload.otp or "").strip()
+    if not challenge_id or not otp.isdigit() or len(otp) != 6:
+        return JSONResponse(status_code=400, content={"success": False, "message": "Enter the 6-digit OTP."})
+
+    with _MFA_CHALLENGES_LOCK:
+        challenge = _MFA_CHALLENGES.get(challenge_id)
+        if not challenge:
+            return JSONResponse(status_code=400, content={"success": False, "message": "OTP session is invalid or expired."})
+        if time.time() > challenge["expires_at"]:
+            _MFA_CHALLENGES.pop(challenge_id, None)
+            return JSONResponse(status_code=400, content={"success": False, "message": "OTP expired. Please log in again."})
+        if challenge["attempts"] >= MFA_MAX_ATTEMPTS:
+            _MFA_CHALLENGES.pop(challenge_id, None)
+            return JSONResponse(status_code=429, content={"success": False, "message": "Too many OTP attempts. Please log in again."})
+        if not check_password_hash(challenge["otp_hash"], otp):
+            challenge["attempts"] += 1
+            if challenge["attempts"] >= MFA_MAX_ATTEMPTS:
+                _MFA_CHALLENGES.pop(challenge_id, None)
+                return JSONResponse(status_code=429, content={"success": False, "message": "Too many OTP attempts. Please log in again."})
+            remaining = MFA_MAX_ATTEMPTS - challenge["attempts"]
+            return JSONResponse(status_code=401, content={"success": False, "message": f"Incorrect OTP. {remaining} attempt(s) remaining."})
+        # One-time use: remove the challenge before performing the final login actions.
+        challenge = _MFA_CHALLENGES.pop(challenge_id, None)
+
+    if not challenge:
+        return JSONResponse(status_code=400, content={"success": False, "message": "OTP session is invalid or expired."})
+
+    login_type = challenge["login_type"]
+    profile = challenge["profile"]
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse(status_code=500, content={"success": False, "message": "Database connection failed"})
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        if login_type == "user":
+            cursor.execute(
+                """
+                UPDATE NRM_LOGINS
+                SET IS_ACTIVE = 'Y',
+                    LAST_LOGIN = CURRENT_TIMESTAMP,
+                    UPDATED_AT = CURRENT_TIMESTAMP
+                WHERE USER_ID = :1
+                """,
+                (profile["id"],),
+            )
+            conn.commit()
+            _session_set(int(profile["id"]), profile, ttl=86400)
+            _profile_set(int(profile["id"]), profile, ttl=1800)
+            _auth_set(
+                int(profile["id"]),
+                [str((profile.get("usertype") or "user")).lower()],
+                str((profile.get("usertype") or "user")).lower(),
+                ttl=3600,
+            )
+            _apicache_set(f"home:user:{profile['id']}", profile, ttl=300)
+            return {"success": True, "login_type": "user", "user": profile}
+
+        if login_type == "employee":
+            cursor.execute(
+                "UPDATE EMP_NRM_LOGINS SET LOGOUT_TIME = NULL WHERE EMPLOYEE_ID = :1",
+                (profile["employee_id"],),
+            )
+            conn.commit()
+            return {"success": True, "login_type": "employee", "employee": profile}
+
+        return JSONResponse(status_code=400, content={"success": False, "message": "Invalid login type"})
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "message": "Unable to complete login after OTP verification."})
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/home/resend-otp")
+async def home_resend_otp(request: Request):
+    data = await _get_request_data(request)
+    challenge_id = (data.get("challenge_id") or "").strip()
+    with _MFA_CHALLENGES_LOCK:
+        challenge = _MFA_CHALLENGES.get(challenge_id)
+        if not challenge or time.time() > challenge["expires_at"]:
+            _MFA_CHALLENGES.pop(challenge_id, None)
+            return JSONResponse(status_code=400, content={"success": False, "message": "OTP session is invalid or expired. Please log in again."})
+        if challenge["resends"] >= MFA_MAX_RESENDS:
+            return JSONResponse(status_code=429, content={"success": False, "message": "OTP resend limit reached. Please log in again."})
+        email = challenge["email"]
+        otp = f"{secrets.randbelow(1_000_000):06d}"
+        # Reserve the resend and rotate the OTP hash before sending, so older codes stop working.
+        challenge["resends"] += 1
+        challenge["otp_hash"] = generate_password_hash(otp)
+        challenge["attempts"] = 0
+        challenge["expires_at"] = time.time() + MFA_OTP_TTL_SECONDS
+    try:
+        _prof = challenge.get("profile") or {}
+        _send_mfa_otp_email(
+            email, otp, challenge.get("login_type", "user"),
+            _prof.get("username") or _prof.get("employee_name") or "",
+        )
+        return {"success": True, "message": "A new OTP has been sent.", "email_hint": _mask_mfa_email(email)}
+    except Exception as exc:
+        print(f"❌ MFA resend failed: {exc}")
+        return JSONResponse(status_code=503, content={"success": False, "message": "Unable to resend OTP. Please try again later."})
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1533,7 +1879,7 @@ async def get_batches():
         cursor.execute(
             """
             SELECT
-                COALESCE(b.DISPLAY_NAME, c.COURSE_NAME) AS course_name,
+                c.COURSE_NAME                           AS course_name,
                 b.LANGUAGE                              AS language_name,
                 b.START_DATE,
                 b.END_DATE,
@@ -1621,7 +1967,20 @@ async def get_feedback():
         )
 
         rows = cursor.fetchall()
-        feedbacks = [{"username": row[0], "feedback_message": row[1]} for row in rows]
+        def _txt(v):
+            if v is None:
+                return ""
+            if hasattr(v, "read"):
+                v = v.read()
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", errors="replace")
+            return str(v)
+
+        feedbacks = [
+            {"username": _txt(r[0]) or "Anonymous", "feedback_message": _txt(r[1])}
+            for r in rows
+        ]
+
         response_data = {"success": True, "feedbacks": feedbacks}
         home_cache_set("feedback", response_data)
         return response_data
