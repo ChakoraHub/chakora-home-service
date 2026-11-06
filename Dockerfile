@@ -15,10 +15,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 
-# Copy dependencies and install using only verified binary packages
+# Copy requirements file for layer tracking
 COPY requirements.txt /app/requirements.txt
+
+# Install dependencies using only verified binary packages with locked versions
 RUN pip install --no-cache-dir --only-binary :all: --upgrade pip==25.0.1 && \
-    pip install --no-cache-dir --only-binary :all: -r requirements.txt
+    pip install --no-cache-dir --only-binary :all: \
+        fastapi==0.115.8 \
+        uvicorn==0.34.0 \
+        oracledb==2.5.1 \
+        werkzeug==3.1.3 \
+        pydantic==2.10.6 \
+        python-dotenv==1.0.1 \
+        itsdangerous==2.2.0 \
+        boto3==1.36.19
 
 # Copy application code
 COPY home_service.py /app/home_service.py
