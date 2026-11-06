@@ -11,13 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependencies first for Docker layer caching
+# Create non-root user for container security
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
+
+# Copy dependencies and install using only verified binary packages
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --only-binary :all: --upgrade pip==25.0.1 && \
+    pip install --no-cache-dir --only-binary :all: -r requirements.txt
 
 # Copy application code
 COPY home_service.py /app/home_service.py
+
+# Switch to non-root user
+USER appuser
 
 # Expose service port
 EXPOSE 5001

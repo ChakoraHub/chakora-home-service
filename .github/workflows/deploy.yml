@@ -233,3 +233,4 @@ jobs:
           script: |
             rm -f /home/ec2-user/home-maintenance.flag /tmp/home-maintenance.flag "${{ secrets.APP_PATH }}/home-maintenance.flag" || true
             echo "Direct SSH maintenance flag cleanup completed."
+

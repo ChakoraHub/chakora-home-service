@@ -6,3 +6,4 @@ __pycache__/
 selenium-results.xml
 *.log
 .env
+

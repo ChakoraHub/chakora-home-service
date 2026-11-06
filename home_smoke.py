@@ -157,3 +157,4 @@ def test_home_batches_or_enquiry_present(driver):
         EC.presence_of_element_located((By.CSS_SELECTOR, "#enquirySection, .enquiry-card, .fas.fa-graduation-cap"))
     )
     assert section is not None, "Neither batches nor enquiry section found on home page"
+
