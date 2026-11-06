@@ -88,13 +88,26 @@ jobs:
             git fetch https://github.com/ChakoraHub/chakora-home-service.git main
             git checkout -f -B main FETCH_HEAD
 
+            echo "Setting up Python environment..."
+            # Check if home-venv has a working interpreter; if broken, remove and recreate
+            if [ -d "home-venv" ] && ! ./home-venv/bin/python --version >/dev/null 2>&1; then
+              echo "Existing home-venv interpreter is broken or stale. Recreating..."
+              rm -rf home-venv
+            fi
+
+            if [ ! -d "home-venv" ]; then
+              echo "Creating fresh home-venv virtual environment..."
+              python3 -m venv home-venv || python -m venv home-venv
+            fi
+
             echo "Installing Python dependencies..."
-            if [ -d "home-venv" ]; then
+            if [ -x "./home-venv/bin/pip" ]; then
+              ./home-venv/bin/pip install --upgrade pip setuptools wheel || true
               ./home-venv/bin/pip install -r requirements.txt
-            elif [ -d "venv" ]; then
+            elif [ -x "./venv/bin/pip" ]; then
               ./venv/bin/pip install -r requirements.txt
             else
-              pip install -r requirements.txt
+              pip install -r requirements.txt || pip3 install -r requirements.txt
             fi
 
             echo "Restarting PM2 application..."
@@ -102,7 +115,11 @@ jobs:
             if [ -z "$SERVICE_NAME" ]; then
               SERVICE_NAME="home-service"
             fi
-            pm2 restart "$SERVICE_NAME" || pm2 start "uvicorn home_service:app --host 0.0.0.0 --port 5001" --name "$SERVICE_NAME"
+            if [ -x "./home-venv/bin/uvicorn" ]; then
+              pm2 restart "$SERVICE_NAME" || pm2 start "./home-venv/bin/uvicorn home_service:app --host 0.0.0.0 --port 5001" --name "$SERVICE_NAME"
+            else
+              pm2 restart "$SERVICE_NAME" || pm2 start "uvicorn home_service:app --host 0.0.0.0 --port 5001" --name "$SERVICE_NAME"
+            fi
             pm2 save
 
             echo "Deployment commands completed successfully."

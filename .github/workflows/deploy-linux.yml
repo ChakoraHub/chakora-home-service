@@ -20,7 +20,25 @@ jobs:
           script: |
             cd ${{ secrets.APP_PATH }}
             git pull origin main
-            source home-venv/bin/activate || source venv/bin/activate || true
-            test -f requirements.txt && pip install -r requirements.txt || true
-            pm2 restart home-service || pm2 restart ${{ secrets.PM2_SERVICE_NAME }} || pm2 start "uvicorn home_service:app --host 0.0.0.0 --port 5001" --name home-service
+            if [ -d "home-venv" ] && ! ./home-venv/bin/python --version >/dev/null 2>&1; then
+              rm -rf home-venv
+            fi
+            if [ ! -d "home-venv" ]; then
+              python3 -m venv home-venv || python -m venv home-venv
+            fi
+            if [ -x "./home-venv/bin/pip" ]; then
+              ./home-venv/bin/pip install --upgrade pip setuptools wheel || true
+              ./home-venv/bin/pip install -r requirements.txt
+            else
+              pip install -r requirements.txt || true
+            fi
+            SERVICE_NAME="${{ secrets.PM2_SERVICE_NAME }}"
+            if [ -z "$SERVICE_NAME" ]; then
+              SERVICE_NAME="home-service"
+            fi
+            if [ -x "./home-venv/bin/uvicorn" ]; then
+              pm2 restart "$SERVICE_NAME" || pm2 start "./home-venv/bin/uvicorn home_service:app --host 0.0.0.0 --port 5001" --name "$SERVICE_NAME"
+            else
+              pm2 restart "$SERVICE_NAME" || pm2 start "uvicorn home_service:app --host 0.0.0.0 --port 5001" --name "$SERVICE_NAME"
+            fi
             pm2 save
