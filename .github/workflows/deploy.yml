@@ -89,9 +89,12 @@ jobs:
             git checkout -f -B main FETCH_HEAD
 
             echo "Setting up Python environment..."
-            # Check if home-venv has a working interpreter; if broken, remove and recreate
-            if [ -d "home-venv" ] && ! ./home-venv/bin/python --version >/dev/null 2>&1; then
-              echo "Existing home-venv interpreter is broken or stale. Recreating..."
+            # Check that both the interpreter and pip launcher work; if either is broken, recreate
+            if [ -d "home-venv" ] && {
+              ! ./home-venv/bin/python --version >/dev/null 2>&1 ||
+              ! ./home-venv/bin/pip --version >/dev/null 2>&1
+            }; then
+              echo "Existing home-venv interpreter or pip launcher is broken or stale. Recreating..."
               rm -rf home-venv
             fi
 
