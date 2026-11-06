@@ -89,13 +89,19 @@ jobs:
             git checkout -f -B main FETCH_HEAD
 
             echo "Installing Python dependencies..."
-            if [ -d "home-venv" ]; then
-              ./home-venv/bin/pip install -r requirements.txt
-            elif [ -d "venv" ]; then
-              ./venv/bin/pip install -r requirements.txt
-            else
-              pip install -r requirements.txt
+            VENV_DIR=""
+            for candidate in home-venv venv; do
+              if [ -x "$candidate/bin/python" ] && "$candidate/bin/python" -m pip --version >/dev/null 2>&1; then
+                VENV_DIR="$candidate"
+                break
+              fi
+            done
+            if [ -z "$VENV_DIR" ]; then
+              echo "No usable virtual environment found; creating home-venv..."
+              python3 -m venv --clear home-venv
+              VENV_DIR="home-venv"
             fi
+            "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 
             echo "Restarting PM2 application..."
             SERVICE_NAME="${{ secrets.PM2_SERVICE_NAME }}"
@@ -233,4 +239,3 @@ jobs:
           script: |
             rm -f /home/ec2-user/home-maintenance.flag /tmp/home-maintenance.flag "${{ secrets.APP_PATH }}/home-maintenance.flag" || true
             echo "Direct SSH maintenance flag cleanup completed."
-
