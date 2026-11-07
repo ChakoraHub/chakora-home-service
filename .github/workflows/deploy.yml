@@ -89,10 +89,12 @@ jobs:
             git checkout -f -B main FETCH_HEAD
 
             echo "Setting up Python environment..."
-            # Check if home-venv has a working interpreter; if broken, remove and recreate
-            if [ -d "home-venv" ] && ! ./home-venv/bin/python --version >/dev/null 2>&1; then
-              echo "Existing home-venv interpreter is broken or stale. Recreating..."
-              rm -rf home-venv
+            # Check if home-venv has a working interpreter and pip module; if broken, recreate
+            if [ -d "home-venv" ]; then
+              if ! ./home-venv/bin/python -m pip --version >/dev/null 2>&1; then
+                echo "Existing home-venv is broken or stale. Recreating..."
+                rm -rf home-venv
+              fi
             fi
 
             if [ ! -d "home-venv" ]; then
@@ -101,11 +103,12 @@ jobs:
             fi
 
             echo "Installing Python dependencies..."
-            if [ -x "./home-venv/bin/pip" ]; then
-              ./home-venv/bin/pip install --upgrade pip setuptools wheel || true
-              ./home-venv/bin/pip install -r requirements.txt
-            elif [ -x "./venv/bin/pip" ]; then
-              ./venv/bin/pip install -r requirements.txt
+            # Use python -m pip to bypass any launcher script issues
+            if [ -f "./home-venv/bin/python" ]; then
+              ./home-venv/bin/python -m pip install --upgrade pip setuptools wheel || true
+              ./home-venv/bin/python -m pip install -r requirements.txt
+            elif [ -f "./venv/bin/python" ]; then
+              ./venv/bin/python -m pip install -r requirements.txt
             else
               pip install -r requirements.txt || pip3 install -r requirements.txt
             fi
