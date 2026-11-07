@@ -20,15 +20,17 @@ jobs:
           script: |
             cd ${{ secrets.APP_PATH }}
             git pull origin main
-            if [ -d "home-venv" ] && ! ./home-venv/bin/python --version >/dev/null 2>&1; then
-              rm -rf home-venv
+            if [ -d "home-venv" ]; then
+              if ! ./home-venv/bin/python -m pip --version >/dev/null 2>&1; then
+                rm -rf home-venv
+              fi
             fi
             if [ ! -d "home-venv" ]; then
               python3 -m venv home-venv || python -m venv home-venv
             fi
-            if [ -x "./home-venv/bin/pip" ]; then
-              ./home-venv/bin/pip install --upgrade pip setuptools wheel || true
-              ./home-venv/bin/pip install -r requirements.txt
+            if [ -f "./home-venv/bin/python" ]; then
+              ./home-venv/bin/python -m pip install --upgrade pip setuptools wheel || true
+              ./home-venv/bin/python -m pip install -r requirements.txt
             else
               pip install -r requirements.txt || true
             fi
