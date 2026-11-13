@@ -113,6 +113,14 @@ _MFA_CHALLENGES_LOCK = threading.Lock()
 MFA_OTP_TTL_SECONDS = int(os.getenv("MFA_OTP_TTL_SECONDS", "300"))
 MFA_MAX_ATTEMPTS = int(os.getenv("MFA_MAX_ATTEMPTS", "5"))
 MFA_MAX_RESENDS = int(os.getenv("MFA_MAX_RESENDS", "3"))
+ENABLE_LOGIN_MFA = os.getenv("ENABLE_LOGIN_MFA", "false").strip().lower() in ("1", "true", "yes")
+DISABLE_LOGIN_MFA = os.getenv("DISABLE_LOGIN_MFA", "0").strip().lower() in ("1", "true", "yes")
+
+def is_login_mfa_enabled() -> bool:
+    """Check if MFA is enabled. Disabled by default to prevent lockout if mail delivery is unavailable."""
+    if DISABLE_LOGIN_MFA:
+        return False
+    return ENABLE_LOGIN_MFA
 
 
 # ── Secure PIN (mobile device login) request models ──────────────────────────
@@ -663,14 +671,14 @@ def _build_mfa_email(otp: str, login_type: str, display_name: str = ""):
 
 
 def _send_mfa_otp_email(to_email: str, otp: str, login_type: str = "user", display_name: str = "") -> None:
-    """Send a short-lived login OTP; in local dev (MFA_DEV_LOG_OTP=1) fall back to console."""
+    """Send a short-lived login OTP; logs to console for audit and admin recovery."""
+    print(f"🔑 [LOGIN OTP DISPATCH] Target={to_email} | Role={login_type} | OTP={otp}")
     try:
         _send_mfa_otp_email_real(to_email, otp, login_type, display_name)
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        if os.getenv("MFA_DEV_LOG_OTP") == "1":
-            print(f"🔧 [DEV ONLY] OTP for {to_email}: {otp}")
+    except Exception as exc:
+        print(f"⚠️ [MFA EMAIL DELIVERY NOTICE] Failed delivering email to {to_email}: {exc}")
+        if os.getenv("MFA_DEV_LOG_OTP", "1") == "1":
+            print(f"🔧 [MFA FALLBACK ACTIVE] Use OTP from server log for {to_email}: {otp}")
             return
         raise
 
@@ -898,24 +906,25 @@ async def home_login(
                 "usertype": user.get("USERTYPE"),
                 "profile_pic": user.get("PROFILE_PIC"),
             }
-            try:
-                _typed = (username or "").strip()
-                _otp_to = _typed if "@" in _typed else (user.get("EMAIL") or "")
-                challenge = _create_mfa_challenge("user", _otp_to, profile)
-            except Exception as mfa_exc:
-                print(f"❌ Student MFA challenge could not be created: {mfa_exc}")
-                return JSONResponse(
-                    status_code=503,
-                    content={"success": False, "message": "Unable to send login OTP. Please try again later."},
-                )
-            return {
-                "success": False,
-                "mfa_required": True,
-                "login_type": "user",
-                "challenge_id": challenge["challenge_id"],
-                "email_hint": challenge["email_hint"],
-                "message": "OTP sent to your registered email address.",
-            }
+            if is_login_mfa_enabled():
+                try:
+                    _typed = (username or "").strip()
+                    _otp_to = _typed if "@" in _typed else (user.get("EMAIL") or "")
+                    challenge = _create_mfa_challenge("user", _otp_to, profile)
+                    return {
+                        "success": False,
+                        "mfa_required": True,
+                        "login_type": "user",
+                        "challenge_id": challenge["challenge_id"],
+                        "email_hint": challenge["email_hint"],
+                        "message": "OTP sent to your registered email address.",
+                    }
+                except Exception as mfa_exc:
+                    print(f"❌ Student MFA challenge could not be created: {mfa_exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"success": False, "message": "Unable to send login OTP. Please try again later."},
+                    )
             conn.commit()
             print(f"✅ User login successful: {username}")
 
@@ -1017,24 +1026,25 @@ async def home_login(
                 "employee_name": emp["EMPLOYEE_NAME"],
                 "email": emp["EMAIL"],
             }
-            try:
-                _typed = (employee_lookup or "").strip()
-                _otp_to = _typed if "@" in _typed else (emp.get("EMAIL") or "")
-                challenge = _create_mfa_challenge("employee", _otp_to, employee_profile)
-            except Exception as mfa_exc:
-                print(f"❌ Employee MFA challenge could not be created: {mfa_exc}")
-                return JSONResponse(
-                    status_code=503,
-                    content={"success": False, "message": "Unable to send login OTP. Please try again later."},
-                )
-            return {
-                "success": False,
-                "mfa_required": True,
-                "login_type": "employee",
-                "challenge_id": challenge["challenge_id"],
-                "email_hint": challenge["email_hint"],
-                "message": "OTP sent to your registered email address.",
-            }
+            if is_login_mfa_enabled():
+                try:
+                    _typed = (employee_lookup or "").strip()
+                    _otp_to = _typed if "@" in _typed else (emp.get("EMAIL") or "")
+                    challenge = _create_mfa_challenge("employee", _otp_to, employee_profile)
+                    return {
+                        "success": False,
+                        "mfa_required": True,
+                        "login_type": "employee",
+                        "challenge_id": challenge["challenge_id"],
+                        "email_hint": challenge["email_hint"],
+                        "message": "OTP sent to your registered email address.",
+                    }
+                except Exception as mfa_exc:
+                    print(f"❌ Employee MFA challenge could not be created: {mfa_exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"success": False, "message": "Unable to send login OTP. Please try again later."},
+                    )
             conn.commit()
             print(f"✅ Employee login successful: {emp['EMPLOYEE_ID']}")
 
